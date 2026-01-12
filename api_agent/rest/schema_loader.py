@@ -1,0 +1,303 @@
+"""OpenAPI 3.x spec loader and compact schema context builder."""
+
+import json
+import logging
+from typing import Any
+
+import httpx
+import yaml
+
+from ..config import settings
+
+logger = logging.getLogger(__name__)
+
+
+async def load_openapi_spec(
+    spec_url: str,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Load OpenAPI 3.x spec from URL.
+
+    Args:
+        spec_url: URL to OpenAPI 3.x spec
+        headers: Optional auth headers
+
+    Returns:
+        Parsed OpenAPI spec dict, or empty dict on error.
+    """
+    if not spec_url:
+        return {}
+
+    request_headers = {}
+    if headers:
+        request_headers.update(headers)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(spec_url, headers=request_headers)
+            resp.raise_for_status()
+            raw = resp.text
+
+        # Parse JSON or YAML
+        if raw.strip().startswith("{"):
+            spec = json.loads(raw)
+        else:
+            spec = yaml.safe_load(raw)
+
+        # Validate OpenAPI 3.x
+        openapi_version = spec.get("openapi", "")
+        if not openapi_version.startswith("3."):
+            logger.warning(f"Unsupported OpenAPI version: {openapi_version}, expected 3.x")
+            return {}
+
+        return spec
+
+    except Exception as e:
+        logger.exception(f"Failed to load OpenAPI spec: {e}")
+        return {}
+
+
+def get_base_url_from_spec(spec: dict[str, Any], spec_url: str = "") -> str:
+    """Extract base URL from OpenAPI spec's servers[0], or derive from spec URL."""
+    servers = spec.get("servers", [])
+    if servers:
+        return servers[0].get("url", "")
+
+    # Fallback: derive from spec URL (e.g., https://api.example.com/openapi.json -> https://api.example.com)
+    if spec_url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(spec_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    return ""
+
+
+def _infer_string_format(field_name: str) -> str:
+    """Infer string format from field name when not in schema."""
+    if not field_name:
+        return ""
+    name_lower = field_name.lower()
+    if "datetime" in name_lower:
+        return "date-time"
+    if "date" in name_lower and "update" not in name_lower:
+        return "date"
+    if "time" in name_lower and "update" not in name_lower:
+        return "time"
+    return ""
+
+
+def _schema_to_type(
+    schema: dict[str, Any],
+    schemas: dict[str, Any] | None = None,
+    field_name: str = "",
+) -> str:
+    """Convert JSON Schema to compact type notation."""
+    if not schema:
+        return "any"
+
+    # Handle $ref
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        # Extract type name from #/components/schemas/TypeName
+        return ref.split("/")[-1]
+
+    schema_type = schema.get("type", "any")
+    # OpenAPI 3.1 allows type arrays like ["string", "null"] - use first non-null type
+    if isinstance(schema_type, list):
+        non_null = [t for t in schema_type if t != "null"]
+        schema_type = non_null[0] if non_null else "any"
+
+    if schema_type == "array":
+        items = schema.get("items", {})
+        return f"{_schema_to_type(items, schemas)}[]"
+
+    if schema_type == "object":
+        # Check for additionalProperties (dict type)
+        if schema.get("additionalProperties"):
+            val_type = _schema_to_type(schema["additionalProperties"], schemas)
+            return f"dict[str, {val_type}]"
+        return "object"
+
+    # Preserve string format (date-time, date, uri, etc.)
+    if schema_type == "string":
+        fmt = schema.get("format", "") or _infer_string_format(field_name)
+        return f"str({fmt})" if fmt else "str"
+
+    type_map = {
+        "integer": "int",
+        "number": "float",
+        "boolean": "bool",
+    }
+    return type_map.get(schema_type, schema_type)
+
+
+def _format_params(params: list[dict[str, Any]]) -> str:
+    """Format ONLY required parameters. Optional params stripped."""
+    parts = []
+    for p in params:
+        name = p.get("name", "")
+        required = p.get("required", p.get("in") == "path")  # path params always required
+        if not required:
+            continue  # Skip optional params
+        schema = p.get("schema", {})
+        type_str = _schema_to_type(schema, field_name=name)
+        parts.append(f"{name}: {type_str}")
+    return ", ".join(parts)
+
+
+def _extract_response_type(responses: dict[str, Any]) -> str:
+    """Extract return type from responses."""
+    # Check 200/201 responses
+    for code in ["200", "201", "default"]:
+        if code in responses:
+            resp = responses[code]
+            content = resp.get("content", {})
+            json_content = content.get("application/json", {})
+            schema = json_content.get("schema", {})
+            if schema:
+                return _schema_to_type(schema)
+    return "any"
+
+
+def _format_schema(name: str, schema: dict[str, Any]) -> str:
+    """Format schema definition with ONLY required fields.
+
+    Optional fields are stripped to prevent agent from inventing values.
+    """
+    if schema.get("type") == "object" or "properties" in schema:
+        props = schema.get("properties", {})
+        raw_required = schema.get("required", [])
+        required = set(r for r in raw_required if isinstance(r, str))
+        fields = []
+        # Only include required fields
+        for field_name, field_schema in props.items():
+            if field_name not in required:
+                continue  # Skip optional fields
+            field_type = _schema_to_type(field_schema, field_name=field_name)
+            fields.append(f"{field_name}: {field_type}!")
+        return f"{name} {{ {', '.join(fields)} }}"
+
+    elif schema.get("enum"):
+        vals = " | ".join(str(v) for v in schema["enum"])
+        return f"{name}: enum({vals})"
+
+    return f"{name}: {_schema_to_type(schema)}"
+
+
+def build_schema_context(spec: dict[str, Any]) -> str:
+    """Build compact schema context from OpenAPI spec.
+
+    Format:
+        <endpoints>
+        GET /users(limit?: int, offset?: int) -> User[]  # List users
+        GET /users/{id}() -> User  # Get user by ID
+
+        <schemas>
+        User { id: str!, name: str!, email?: str }
+
+        <auth>
+        Bearer token in Authorization header
+    """
+    if not spec:
+        return ""
+
+    lines = ["<endpoints>"]
+
+    # Process paths
+    paths = spec.get("paths", {})
+    for path, path_item in paths.items():
+        for method in ["get", "post", "put", "delete", "patch"]:
+            if method not in path_item:
+                continue
+
+            op = path_item[method]
+            params = op.get("parameters", [])
+            # Also include path-level parameters
+            params = path_item.get("parameters", []) + params
+
+            # Extract request body type for POST/PUT/PATCH
+            body_type = ""
+            if method in ["post", "put", "patch"]:
+                req_body = op.get("requestBody", {})
+                content = req_body.get("content", {})
+                json_content = content.get("application/json", {})
+                body_schema = json_content.get("schema", {})
+                if body_schema:
+                    required = req_body.get("required", False)
+                    body_type = _schema_to_type(body_schema)
+                    suffix = "!" if required else ""
+                    body_type = f"body: {body_type}{suffix}"
+
+            param_str = _format_params(params)
+            # Prepend body type if present
+            if body_type:
+                param_str = f"{body_type}, {param_str}" if param_str else body_type
+
+            response_type = _extract_response_type(op.get("responses", {}))
+            summary = op.get("description") or op.get("summary") or op.get("operationId", "")
+
+            desc = f"  # {summary}" if summary else ""
+            lines.append(f"{method.upper()} {path}({param_str}) -> {response_type}{desc}")
+
+    # Process schemas
+    schemas = spec.get("components", {}).get("schemas", {})
+    if schemas:
+        lines.append("\n<schemas>")
+        for name, schema in schemas.items():
+            lines.append(_format_schema(name, schema))
+
+    # Auth info
+    security_schemes = spec.get("components", {}).get("securitySchemes", {})
+    if security_schemes:
+        lines.append("\n<auth>")
+        for name, scheme in security_schemes.items():
+            scheme_type = scheme.get("type", "")
+            if scheme_type == "http":
+                bearer_format = scheme.get("bearerFormat", "")
+                lines.append(f"{name}: HTTP {scheme.get('scheme', '')} {bearer_format}".strip())
+            elif scheme_type == "apiKey":
+                in_loc = scheme.get("in", "")
+                key_name = scheme.get("name", "")
+                lines.append(f"{name}: API key in {in_loc} '{key_name}'")
+            elif scheme_type == "oauth2":
+                lines.append(f"{name}: OAuth2")
+            else:
+                lines.append(f"{name}: {scheme_type}")
+
+    return "\n".join(lines)
+
+
+async def fetch_schema_context(
+    spec_url: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
+    """Fetch and build schema context.
+
+    Args:
+        spec_url: URL to OpenAPI spec
+        headers: Optional auth headers
+
+    Returns:
+        Tuple of (truncated_context, base_url, raw_spec_json)
+    """
+    spec = await load_openapi_spec(spec_url, headers)
+    if not spec:
+        return "", "", ""
+
+    # Raw spec JSON for grep-like search (preserves all info)
+    raw_spec_json = json.dumps(spec, indent=2)
+
+    # Build DSL for LLM context
+    dsl_context = build_schema_context(spec)
+    base_url = get_base_url_from_spec(spec, spec_url)
+
+    # Truncate DSL if too large
+    context = dsl_context
+    if len(context) > settings.MAX_SCHEMA_CHARS:
+        context = (
+            context[: settings.MAX_SCHEMA_CHARS]
+            + "\n[SCHEMA TRUNCATED - use search_schema() to explore]"
+        )
+
+    return context, base_url, raw_spec_json

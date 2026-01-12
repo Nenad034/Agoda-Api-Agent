@@ -1,0 +1,374 @@
+"""Tests for REST/OpenAPI schema context generation."""
+
+import pytest
+
+from api_agent.rest.schema_loader import (
+    _format_params,
+    _format_schema,
+    _infer_string_format,
+    _schema_to_type,
+    build_schema_context,
+)
+
+
+class TestSchemaToType:
+    """Test OpenAPI type to compact notation conversion."""
+
+    def test_string(self):
+        assert _schema_to_type({"type": "string"}) == "str"
+
+    def test_integer(self):
+        assert _schema_to_type({"type": "integer"}) == "int"
+
+    def test_number(self):
+        assert _schema_to_type({"type": "number"}) == "float"
+
+    def test_boolean(self):
+        assert _schema_to_type({"type": "boolean"}) == "bool"
+
+    def test_array(self):
+        assert _schema_to_type({"type": "array", "items": {"type": "string"}}) == "str[]"
+
+    def test_array_of_objects(self):
+        assert (
+            _schema_to_type({"type": "array", "items": {"$ref": "#/components/schemas/User"}})
+            == "User[]"
+        )
+
+    def test_ref(self):
+        assert _schema_to_type({"$ref": "#/components/schemas/User"}) == "User"
+
+    def test_object(self):
+        assert _schema_to_type({"type": "object"}) == "object"
+
+    def test_dict_type(self):
+        schema = {"type": "object", "additionalProperties": {"type": "string"}}
+        assert _schema_to_type(schema) == "dict[str, str]"
+
+    def test_empty(self):
+        assert _schema_to_type({}) == "any"
+
+    def test_none(self):
+        assert _schema_to_type(None) == "any"
+
+    def test_nullable_type_array(self):
+        """OpenAPI 3.1 nullable types as array."""
+        assert _schema_to_type({"type": ["string", "null"]}) == "str"
+        assert _schema_to_type({"type": ["integer", "null"]}) == "int"
+        assert _schema_to_type({"type": ["null"]}) == "any"
+
+    def test_string_with_format(self):
+        """String format preserved in notation."""
+        assert _schema_to_type({"type": "string", "format": "date-time"}) == "str(date-time)"
+        assert _schema_to_type({"type": "string", "format": "date"}) == "str(date)"
+        assert _schema_to_type({"type": "string", "format": "uri"}) == "str(uri)"
+        assert _schema_to_type({"type": "string", "format": "email"}) == "str(email)"
+        assert _schema_to_type({"type": "string"}) == "str"  # no format
+
+    def test_string_format_inferred_from_field_name(self):
+        """Format inferred from field name when not in schema."""
+        # datetime inferred
+        assert _schema_to_type({"type": "string"}, field_name="departDateTime") == "str(date-time)"
+        assert _schema_to_type({"type": "string"}, field_name="arrivalDateTime") == "str(date-time)"
+        # date inferred
+        assert _schema_to_type({"type": "string"}, field_name="birthDate") == "str(date)"
+        # explicit format takes precedence
+        assert (
+            _schema_to_type({"type": "string", "format": "uri"}, field_name="dateTime")
+            == "str(uri)"
+        )
+        # no inference for unrelated names
+        assert _schema_to_type({"type": "string"}, field_name="name") == "str"
+        # "update" excluded to avoid false positives like "updatedAt"
+        assert _schema_to_type({"type": "string"}, field_name="updateDate") == "str"
+
+
+class TestInferStringFormat:
+    """Test format inference from field names."""
+
+    def test_datetime_field(self):
+        assert _infer_string_format("departDateTime") == "date-time"
+        assert _infer_string_format("arrivalDateTime") == "date-time"
+        assert _infer_string_format("createdDatetime") == "date-time"
+
+    def test_date_field(self):
+        assert _infer_string_format("birthDate") == "date"
+        assert _infer_string_format("startDate") == "date"
+
+    def test_time_field(self):
+        assert _infer_string_format("openTime") == "time"
+        assert _infer_string_format("checkInTime") == "time"
+        assert _infer_string_format("departureTime") == "time"
+
+    def test_excludes_update(self):
+        """Avoid false positives for 'updatedAt' style fields."""
+        assert _infer_string_format("updateDate") == ""
+        assert _infer_string_format("lastUpdated") == ""
+
+    def test_no_match(self):
+        assert _infer_string_format("name") == ""
+        assert _infer_string_format("email") == ""
+        assert _infer_string_format("") == ""
+
+
+class TestFormatParams:
+    """Test parameter formatting."""
+
+    def test_required_param(self):
+        params = [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}]
+        assert _format_params(params) == "id: str"
+
+    def test_optional_param_stripped(self):
+        """Optional params are now stripped entirely."""
+        params = [
+            {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer"}}
+        ]
+        assert _format_params(params) == ""  # Optional stripped
+
+    def test_path_param_always_required(self):
+        params = [{"name": "id", "in": "path", "schema": {"type": "string"}}]
+        assert _format_params(params) == "id: str"
+
+    def test_multiple_params_only_required(self):
+        """Only required params shown, optional stripped."""
+        params = [
+            {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}},
+            {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer"}},
+        ]
+        assert _format_params(params) == "id: str"  # limit stripped
+
+
+class TestFormatSchema:
+    """Test schema formatting."""
+
+    def test_object_schema_only_required(self):
+        """Only required fields shown, optional stripped."""
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["id"],
+        }
+        result = _format_schema("User", schema)
+        assert "User {" in result
+        assert "id: str!" in result
+        assert "name" not in result  # optional field stripped
+
+    def test_enum_schema(self):
+        schema = {"type": "string", "enum": ["active", "inactive"]}
+        result = _format_schema("Status", schema)
+        assert "Status: enum(active | inactive)" in result
+
+    def test_malformed_required_with_list(self):
+        """Handle malformed OpenAPI where required contains nested lists."""
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["id", ["nested", "list"]],
+        }
+        result = _format_schema("User", schema)
+        assert "id: str!" in result
+        assert "name" not in result  # optional stripped
+
+    def test_malformed_required_with_dict(self):
+        """Handle malformed OpenAPI where required contains dicts."""
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": [{"field": "id"}],
+        }
+        result = _format_schema("User", schema)
+        assert "id" not in result  # dict in required is filtered, so id is optional → stripped
+
+    def test_malformed_required_mixed_types(self):
+        """Handle required with mixed valid and invalid types."""
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a", None, 123, ["x"], "b"],
+        }
+        result = _format_schema("Test", schema)
+        assert "a: str!" in result
+        assert "b: str!" in result
+
+
+class TestBuildSchemaContext:
+    """Test OpenAPI schema context generation."""
+
+    @pytest.fixture
+    def openapi_spec(self):
+        """Realistic OpenAPI 3.x spec fixture."""
+        return {
+            "openapi": "3.0.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": {
+                "/users": {
+                    "get": {
+                        "summary": "List users",
+                        "parameters": [
+                            {
+                                "name": "limit",
+                                "in": "query",
+                                "required": False,
+                                "schema": {"type": "integer"},
+                            },
+                            {
+                                "name": "offset",
+                                "in": "query",
+                                "required": False,
+                                "schema": {"type": "integer"},
+                            },
+                        ],
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/components/schemas/User"},
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+                "/users/{id}": {
+                    "get": {
+                        "summary": "Get user",
+                        "parameters": [
+                            {
+                                "name": "id",
+                                "in": "path",
+                                "required": True,
+                                "schema": {"type": "string"},
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/User"}
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+            },
+            "components": {
+                "schemas": {
+                    "User": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "email": {"type": "string"},
+                        },
+                        "required": ["id", "name"],
+                    }
+                },
+                "securitySchemes": {
+                    "bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+                },
+            },
+        }
+
+    def test_endpoints_section(self, openapi_spec):
+        ctx = build_schema_context(openapi_spec)
+        assert "<endpoints>" in ctx
+        # Optional params stripped, so GET /users has no params
+        assert "GET /users() -> User[]" in ctx
+        assert "GET /users/{id}(id: str) -> User" in ctx
+
+    def test_endpoints_with_summary(self, openapi_spec):
+        ctx = build_schema_context(openapi_spec)
+        assert "# List users" in ctx
+        assert "# Get user" in ctx
+
+    def test_schemas_section(self, openapi_spec):
+        ctx = build_schema_context(openapi_spec)
+        assert "<schemas>" in ctx
+        assert "User {" in ctx
+        assert "id: str!" in ctx
+        assert "name: str!" in ctx
+        assert "email" not in ctx  # optional field stripped
+
+    def test_auth_section(self, openapi_spec):
+        ctx = build_schema_context(openapi_spec)
+        assert "<auth>" in ctx
+        assert "bearerAuth: HTTP bearer JWT" in ctx
+
+    def test_empty_spec(self):
+        ctx = build_schema_context({})
+        assert ctx == ""
+
+    def test_api_key_auth(self):
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {},
+            "components": {
+                "securitySchemes": {
+                    "apiKey": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+                }
+            },
+        }
+        ctx = build_schema_context(spec)
+        assert "apiKey: API key in header 'X-API-Key'" in ctx
+
+    def test_post_endpoint_with_body(self):
+        """POST endpoints show request body type."""
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/search": {
+                    "post": {
+                        "summary": "Search flights",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/SearchRequest"}
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/SearchResponse"}
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {"schemas": {}},
+        }
+        ctx = build_schema_context(spec)
+        assert "POST /search(body: SearchRequest!) -> SearchResponse" in ctx
+
+    def test_post_endpoint_optional_body(self):
+        """POST with optional body."""
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/update": {
+                    "put": {
+                        "requestBody": {
+                            "required": False,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Data"}
+                                }
+                            },
+                        },
+                        "responses": {"200": {}},
+                    }
+                }
+            },
+        }
+        ctx = build_schema_context(spec)
+        assert "PUT /update(body: Data)" in ctx
+        assert "body: Data!" not in ctx  # not required
